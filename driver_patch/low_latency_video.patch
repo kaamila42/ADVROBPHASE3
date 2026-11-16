@@ -1,0 +1,350 @@
+--- a/robomaster_ros/robomaster_ros/modules/camera.py
++++ b/robomaster_ros/robomaster_ros/modules/camera.py
+@@ -1,6 +1,7 @@
+ import enum
+ import queue
+ import threading
++import time
+ from typing import Union
+ 
+ import numpy as np
+@@ -35,6 +36,7 @@
+     from ..client import RoboMasterROS
+ 
+ from .. import Module
++from ..video_pipeline import LosslessVideoConnection, read_video_batch, put_latest
+ 
+ 
+ class ActiveMode(enum.Enum):
+@@ -97,6 +99,20 @@
+ 
+         protocol: str = node.declare_parameter("camera.video.protocol",
+                                                "tcp").value
++        self.low_latency = node.declare_parameter('camera.video.low_latency', False).value
++        self.video_stats = dict(batches=0, decoded=0, published=0, replaced=0,
++                                decode_errors=0, decode_max_s=0., publish_max_s=0.,
++                                queue_age_max_s=0.)
++        self._video_stats_at = time.monotonic()
++        self._video_stats_previous = (0, 0, 0)
++        if self.low_latency:
++            if protocol != 'tcp':
++                raise ValueError('camera.video.low_latency requires TCP video transport')
++            self._video_stream_conn = LosslessVideoConnection(lambda: self.clock.now().nanoseconds)
++            self.logger.info('[Camera] Ordered TCP receiver enabled; encoded-byte dropping disabled')
++        stats_period = float(node.declare_parameter('camera.video.stats_period_s', 0.).value)
++        if self.low_latency and stats_period > 0:
++            node.create_timer(stats_period, self.report_video_stats)
+         self.resolution = node.declare_parameter("camera.video.resolution",
+                                                  self._video_height).value
+         rate: float = node.declare_parameter("camera.video.rate", -1.0).value
+@@ -466,20 +482,31 @@
+         if FFMPEG_AVAILABLE:
+             parser = H264Parser()
+         while self._video_streaming:
+-            # blocking
+-            data = self._video_stream_conn._sock_queue.get()
+-            while True:
+-                # empty the queue
++            if self.low_latency:
+                 try:
+-                    additional_data = self._video_stream_conn._sock_queue.get(
+-                        False)
+-                    if additional_data:
+-                        data += additional_data
++                    batch = read_video_batch(self._video_stream_conn._sock_queue)
+                 except queue.Empty:
++                    continue
++                if batch is None:
+                     break
+-            if not data:
+-                continue
+-            capture_time = self.clock.now()
++                data, stamp_ns, received_at = batch
++                capture_time = rclpy.time.Time(nanoseconds=stamp_ns,
++                                              clock_type=self.clock.clock_type)
++                self.video_stats['batches'] += 1
++                self.video_stats['queue_age_max_s'] = max(
++                    self.video_stats['queue_age_max_s'], time.monotonic()-received_at)
++            else:
++                data = self._video_stream_conn._sock_queue.get()
++                while True:
++                    try:
++                        additional_data = self._video_stream_conn._sock_queue.get(False)
++                        if additional_data:
++                            data += additional_data
++                    except queue.Empty:
++                        break
++                if not data:
++                    continue
++                capture_time = self.clock.now()
+             if self.should_publish_video_ffmpeg:
+                 for is_keyframe, pts, pkt_data in parser.parse(data):
+                     msg = FFMPEGPacket()
+@@ -504,7 +531,19 @@
+             if self.should_publish_video_raw:
+                 if self.next_capture_time is None:
+                     self.next_capture_time = capture_time
+-                frames = self._h264_decode(data)
++                decode_begin = time.monotonic()
++                try:
++                    frames = self._h264_decode(data)
++                except Exception as exc:
++                    if not self.low_latency:
++                        raise
++                    self.video_stats['decode_errors'] += 1
++                    self.logger.warning(f'[Camera] H264 decoder error: {exc}', throttle_duration_sec=2.)
++                    continue
++                if self.low_latency:
++                    self.video_stats['decode_max_s'] = max(
++                        self.video_stats['decode_max_s'], time.monotonic()-decode_begin)
++                    self.video_stats['decoded'] += len(frames)
+                 if not frames:
+                     continue
+                 self._video_frame_count += len(frames)
+@@ -518,11 +557,15 @@
+                     # + rclpy.duration.Duration(nanoseconds=3e8)
+                     i_msg.header.stamp = capture_time.to_msg()
+                     i_msg.header.frame_id = self.frame_id
+-                    try:
+-                        self._message_queue.put(i_msg, block=False)
+-                    except queue.Full:
+-                        pass
++                    if self.low_latency:
++                        self.video_stats['replaced'] += int(put_latest(self._message_queue, i_msg))
++                        if self.min_video_period:
++                            self.next_capture_time = capture_time+self.min_video_period
+                     else:
++                        try:
++                            self._message_queue.put(i_msg, block=False)
++                        except queue.Full:
++                            continue
+                         if self.min_video_period:
+                             self.next_capture_time += self.min_video_period
+ 
+@@ -534,13 +577,42 @@
+                 continue
+             # self.logger.info("Got msg")
+             try:
++                publish_begin = time.monotonic()
+                 self.raw_video_pub.publish(msg)
+             except rclpy._rclpy_pybind11.RCLError:  # type: ignore
+                 return
+             if self.should_publish_camera_info:
+                 self.camera_info_msg.header.stamp = msg.header.stamp
+                 self.camera_info_pub.publish(self.camera_info_msg)
+-            # self.logger.info("Sent msg")
++            if self.low_latency:
++                self.video_stats['published'] += 1
++                self.video_stats['publish_max_s'] = max(
++                    self.video_stats['publish_max_s'], time.monotonic()-publish_begin)
++
++
++    def report_video_stats(self) -> None:
++        """Report receiver, decode and publish rates without extra image subscribers."""
++        receiver = self._video_stream_conn
++        now = time.monotonic()
++        dt = max(now-self._video_stats_at, 1e-6)
++        previous_bytes, previous_decoded, previous_published = self._video_stats_previous
++        stats = self.video_stats
++        self.logger.info(
++            f'[Camera pipeline] tcp_kBps={(receiver.bytes-previous_bytes)/dt/1000:.1f} '
++            f'decoded_fps={(stats["decoded"]-previous_decoded)/dt:.1f} '
++            f'published_fps={(stats["published"]-previous_published)/dt:.1f} '
++            f'byte_queue={receiver._sock_queue.qsize()} backpressure_waits={receiver.queue_waits} '
++            f'decoded_replaced={stats["replaced"]} decode_errors={stats["decode_errors"]} '
++            f'max_decode_ms={stats["decode_max_s"]*1000:.1f} '
++            f'max_publish_ms={stats["publish_max_s"]*1000:.1f} '
++            f'max_queue_ms={stats["queue_age_max_s"]*1000:.1f} '
++            f'max_receive_gap_ms={receiver.max_receive_gap_s*1000:.1f} '
++            f'receive_idle_ms={(now-receiver.last_receive_at)*1000 if receiver.last_receive_at is not None else -1.:.1f} '
++            f'socket_timeouts={receiver.socket_timeouts} '
++            f'tcp_error={receiver.error or "none"}')
++        self._video_stats_at = now
++        self._video_stats_previous = (receiver.bytes, stats['decoded'], stats['published'])
++        stats['decode_max_s'] = stats['publish_max_s'] = stats['queue_age_max_s'] = 0.
+ 
+     @property
+     def audio_should_be_active(self) -> bool:
+--- a/robomaster_ros/launch/main.launch
++++ b/robomaster_ros/launch/main.launch
+@@ -105,6 +105,8 @@
+ 
+   <arg name="video" default="2" description="The default mode for video topics: OFF=0, ON=1, ON_DEMAND=2, DISABLED=-1"/>
+   <arg name="video_resolution" default="360" description="Video resolution: 360, 540 or 720 pixels height"/>
++  <arg name="video_low_latency" default="false" description="Preserve ordered TCP H264 bytes and keep the newest decoded frame"/>
++  <arg name="video_stats_period_s" default="0.0" description="Camera pipeline diagnostic logging period; zero disables it"/>
+   <arg name="video_rate" default="-1.0" description="The camera maximal fps. A negative rate means no throttling."/>
+   <arg name="video_raw" default="$(var video)" description="Enables publishing decoded video stream: OFF=0, ON=1, ON_DEMAND=2, DISABLED=-1"/>
+   <arg name="video_h264" default="$(var video)" description="Enables publishing original H264 encoded video stream: OFF=0, ON=1, ON_DEMAND=2, DISABLED=-1"/>
+@@ -161,6 +163,8 @@
+     <param name="camera">
+       <param name="enabled" value="$(var camera)"/>
+       <param name="video">
++        <param name="low_latency" value="$(var video_low_latency)"/>
++        <param name="stats_period_s" value="$(var video_stats_period_s)"/>
+         <param name="raw" value="$(var video_raw)"/>
+         <param name="h264" value="$(var video_h264)"/>
+         <param name="ffmpeg" value="$(var video_ffmpeg)"/>
+--- /dev/null
++++ b/robomaster_ros/robomaster_ros/video_pipeline.py
+@@ -0,0 +1,160 @@
++"""Ordered TCP video receiver and latest-decoded-frame queue helpers.
++
++Encoded H.264 bytes must never be discarded to reduce latency. TCP backpressure
++bounds memory while preserving decoder continuity. Only decoded frames may be
++replaced safely. This receiver replaces the SDK's one video socket before start;
++it creates neither an additional camera stream nor a second robot client.
++"""
++import queue
++import socket
++import threading
++import time
++from dataclasses import dataclass
++
++
++@dataclass(frozen=True)
++class VideoChunk:
++    data: bytes
++    stamp_ns: int
++    received_at: float
++
++
++class LosslessVideoConnection:
++    def __init__(self, clock_ns=time.time_ns, capacity=32, receive_bytes=32768):
++        self._sock_queue = queue.Queue(maxsize=capacity)
++        self._sock = None
++        self._sock_recv = None
++        self._receiving = False
++        self._closed = False
++        self.clock_ns = clock_ns
++        self.receive_bytes = receive_bytes
++        self.chunks = self.bytes = self.queue_waits = self.socket_timeouts = 0
++        self.last_receive_at = None
++        self.max_receive_gap_s = 0.
++        self.error = ''
++
++    def connect(self, addr, ip_proto='tcp'):
++        if ip_proto != 'tcp':
++            self.error = 'Lossless video receiver requires TCP'
++            return False
++        self._closed = False
++        self.error = ''
++        self.last_receive_at = None
++        self.max_receive_gap_s = 0.
++        self.chunks = self.bytes = self.queue_waits = self.socket_timeouts = 0
++        while True:
++            try:
++                self._sock_queue.get_nowait()
++            except queue.Empty:
++                break
++        try:
++            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++            self._sock.settimeout(3.)
++            self._sock.connect(addr)
++            self._sock.settimeout(.2)
++        except OSError as exc:
++            self.error = str(exc)
++            if self._sock is not None:
++                self._sock.close()
++            return False
++        self._receiving = True
++        self._sock_recv = threading.Thread(target=self._recv_task, daemon=True)
++        self._sock_recv.start()
++        return True
++
++    def _recv_task(self):
++        try:
++            while self._receiving:
++                try:
++                    data = self._sock.recv(self.receive_bytes)
++                except socket.timeout:
++                    self.socket_timeouts += 1
++                    continue
++                except OSError as exc:
++                    if not self._closed:
++                        self.error = str(exc)
++                    break
++                if not data:
++                    if not self._closed:
++                        self.error = 'video_tcp_eof'
++                    break
++                received_at = time.monotonic()
++                if self.last_receive_at is not None:
++                    self.max_receive_gap_s = max(self.max_receive_gap_s, received_at-self.last_receive_at)
++                self.last_receive_at = received_at
++                self.chunks += 1
++                self.bytes += len(data)
++                chunk = VideoChunk(data, self.clock_ns(), received_at)
++                # Never call full/get/drop on compressed TCP fragments. Waiting
++                # slows socket reads and lets TCP apply its normal backpressure.
++                while self._receiving:
++                    try:
++                        self._sock_queue.put(chunk, timeout=.1)
++                        break
++                    except queue.Full:
++                        self.queue_waits += 1
++        finally:
++            self._receiving = False
++            self._signal_end()
++
++    def _signal_end(self):
++        while True:
++            try:
++                self._sock_queue.put(None, timeout=.1)
++                return
++            except queue.Full:
++                if self._closed:
++                    # Discarding bytes is permitted only after stream shutdown.
++                    try:
++                        self._sock_queue.get_nowait()
++                    except queue.Empty:
++                        pass
++
++    def disconnect(self):
++        self._closed = True
++        self._receiving = False
++        if self._sock is not None:
++            try:
++                self._sock.shutdown(socket.SHUT_RDWR)
++            except OSError:
++                pass
++            self._sock.close()
++        if self._sock_recv is not None:
++            self._sock_recv.join(timeout=1.)
++        else:
++            self._signal_end()
++
++
++def read_video_batch(chunks, max_chunks=8, timeout=.2):
++    """Read a bounded batch without losing bytes or chasing a growing queue forever."""
++    first = chunks.get(timeout=timeout)
++    if first is None:
++        return None
++    parts = [first.data]
++    stamp_ns, received_at = first.stamp_ns, first.received_at
++    for _ in range(max_chunks-1):
++        try:
++            chunk = chunks.get_nowait()
++        except queue.Empty:
++            break
++        if chunk is None:
++            # Preserve the terminal marker for the next read, after this data.
++            chunks.put_nowait(None)
++            break
++        parts.append(chunk.data)
++        stamp_ns, received_at = chunk.stamp_ns, chunk.received_at
++    return b''.join(parts), stamp_ns, received_at
++
++
++def put_latest(decoded_queue, message):
++    """Replace an old decoded frame, never H.264 data; return whether one was replaced."""
++    try:
++        decoded_queue.put_nowait(message)
++        return False
++    except queue.Full:
++        try:
++            decoded_queue.get_nowait()
++        except queue.Empty:
++            pass
++        decoded_queue.put_nowait(message)
++        return True

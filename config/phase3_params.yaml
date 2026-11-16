@@ -1,0 +1,67 @@
+/**:
+  ros__parameters:
+    enable_motion: false
+    generate_movement_plots: true
+    show_movement_plots: true
+    estimation_mode: wheel_imu  # A=wheel_only; B=odom_velocity; C=wheel_imu
+    start_distance_m: 2.0  # Measured from front guard.
+    start_reference_verified: false
+    reference_point: front_guard
+    arrival_width_fraction: 0.20
+    nominal_stopping_distance_m: 0.20  # Original lost-tag safeguard only.
+    physical_target_distance_m: 0.26  # Calibrated width-based physical target.
+    wheel_topic: joint_states_p
+    sensor_conventions_verified: false  # Verify gyro units/frame/sign and wheel signs; acceleration is diagnostic.
+    guard_offset_verified: false  # Measure base_link -> front guard, not axle -> guard.
+    guard_offset_xy_m: [0.0, 0.0]  # Unknown placeholder; blocks raw-mode motion.
+    imu_bias_samples: 50
+    gyro_rate_variance_rad2ps2: 0.01
+    gyro_gate_nis: 9.0
+    wheel_velocity_variance_m2ps2: 0.0025
+    wheel_omega_variance_rad2ps2: 0.01
+    wheel_timeout_s: 0.3
+    wheel_max_sync_s: 0.08
+    stationary_linear_mps: 0.005
+    stationary_angular_radps: 0.03
+    settling_duration_s: 0.5
+    settling_timeout_s: 2.0
+    tag_id: 3
+    tag_family: tag36h11
+    tag_size_m: 0.15
+    forward_speed_mps: 0.14
+    bearing_gain: 1.6
+    max_angular_speed_radps: 0.30
+    steering_deadband_rad: 0.01
+    min_angular_speed_radps: 0.05
+    require_arm_pose: true
+    arm_x_m: 0.105
+    arm_z_m: 0.080
+    tof_correction_enabled: false
+    tof_geometry_verified: false
+    tof_offset_verified: false
+    tof_target_surface: ''
+    tof_reference_offset_m: 0.0  # Unmeasured placeholder; cannot enable correction without verification.
+    tof_obstacle_protection_enabled: false
+    tof_obstacle_geometry_verified: false
+    tof_obstacle_distance_m: 0.12
+    tof_variance_m2: 0.0025
+    tof_gate_nis: 9.0
+    tof_max_sync_s: 0.08
+    tof_max_heading_rad: 0.10
+    tof_max_lateral_m: 0.05
+    tof_initial_tolerance_m: 0.10
+    camera_timeout_s: 1.0
+    preview_jpeg_quality: 80
+    detection_timeout_s: 0.20
+    odom_timeout_s: 0.3
+    tof_timeout_s: 0.3
+    max_dt_s: 0.25
+    max_elapsed_s: 30.0
+    max_travel_m: 2.2
+    max_heading_deviation_rad: 0.30
+    max_bearing_rad: 0.30
+    velocity_variance_m2ps2: 0.0025
+    omega_variance_rad2ps2: 0.01
+    input_a_variance_m2ps4: 0.25
+    input_alpha_variance_rad2ps4: 1.0
+    process_density: [0.0001, 0.0001, 0.0001, 0.0025, 0.01]
